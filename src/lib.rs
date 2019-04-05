@@ -2,55 +2,41 @@
 A safe tree using an arena allocator that allows deletion without suffering from
 [the ABA problem](https://en.wikipedia.org/wiki/ABA_problem) by using generational
 indices.
-
 It uses [generational-arena](https://github.com/fitzgen/generational-arena) under
 the hood, made by [fitzgen](https://github.com/fitzgen), special thanks to him.
-
 [generational-arena](https://github.com/fitzgen/generational-arena) is itself inspired
 by [Catherine West's closing keynote at RustConf
 2018](http://rustconf.com/program.html#closingkeynote), where these ideas
 were presented in the context of an Entity-Component-System for games
 programming.
-
 ## What? Why?
-
 When you are working with a tree and you want to add and delete individual
 nodes at a time, or you are writing a game and its world consists of many
 inter-referencing objects with dynamic lifetimes that depend on user
 input. These are situations where matching Rust's ownership and lifetime rules
 can get tricky.
-
 It doesn't make sense to use shared ownership with interior mutability (ie
 `Rc<RefCell<T>>` or `Arc<Mutex<T>>`) nor borrowed references (ie `&'a T` or `&'a
 mut T`) for structures. The cycles rule out reference counted types, and the
 required shared mutability rules out borrows. Furthermore, lifetimes are dynamic
 and don't follow the borrowed-data-outlives-the-borrower discipline.
-
 In these situations, it is tempting to store objects in a `Vec<T>` and have them
 reference each other via their indices. No more borrow checker or ownership
 problems! Often, this solution is good enough.
-
 However, now we can't delete individual items from that `Vec<T>` when we no
 longer need them, because we end up either
-
 * messing up the indices of every element that follows the deleted one, or
-
 * suffering from the [ABA
   problem](https://en.wikipedia.org/wiki/ABA_problem). To elaborate further, if
   we tried to replace the `Vec<T>` with a `Vec<Option<T>>`, and delete an
   element by setting it to `None`, then we create the possibility for this buggy
   sequence:
-
     * `obj1` references `obj2` at index `i`
-
     * someone else deletes `obj2` from index `i`, setting that element to `None`
-
     * a third thing allocates `obj3`, which ends up at index `i`, because the
       element at that index is `None` and therefore available for allocation
-
     * `obj1` attempts to get `obj2` at index `i`, but incorrectly is given
       `obj3`, when instead the get should fail.
-
 By introducing a monotonically increasing generation counter to the collection,
 associating each element in the collection with the generation when it was
 inserted, and getting elements from the collection with the *pair* of index and
@@ -58,41 +44,30 @@ the generation at the time when the element was inserted, then we can solve the
 aforementioned ABA problem. When indexing into the collection, if the index
 pair's generation does not match the generation of the element at that index,
 then the operation fails.
-
 ## Features
-
 * Zero `unsafe`
 * There is different iterators to traverse the tree
 * Well tested
-
 ## Usage
-
 First, add `vec-tree` to your `Cargo.toml`:
-
 ```toml
 [dependencies]
 vec-tree = "0.1"
 ```
-
 Then, import the crate and use the `vec-tree::Tree`
-
 ```rust
 extern crate vec_tree;
 use vec_tree::VecTree;
-
 let mut tree = VecTree::new();
-
 // Insert some elements into the tree.
 let root_node = tree.insert_root(1);
 let child_node_1 = tree.insert(10, root_node);
 let child_node_2 = tree.insert(11, root_node);
 let child_node_3 = tree.insert(12, root_node);
 let grandchild = tree.insert(100, child_node_3);
-
 // Inserted elements can be accessed infallibly via indexing (and missing
 // entries will panic).
 assert_eq!(tree[child_node_1], 10);
-
 // Alternatively, the `get` and `get_mut` methods provide fallible lookup.
 if let Some(node_value) = tree.get(child_node_2) {
     println!("The node value is: {}", node_value);
@@ -100,34 +75,27 @@ if let Some(node_value) = tree.get(child_node_2) {
 if let Some(node_value) = tree.get_mut(grandchild) {
     *node_value = 101;
 }
-
 // We can remove elements.
 tree.remove(child_node_3);
-
 // Insert a new one.
 let child_node_4 = tree.insert(13, root_node);
-
 // The tree does not contain `child_node_3` anymore, but it does contain
 // `child_node_4`, even though they are almost certainly at the same index
 // within the arena of the tree in practice. Ambiguities are resolved with
 // an associated generation tag.
 assert!(!tree.contains(child_node_3));
 assert!(tree.contains(child_node_4));
-
 // We can also move a node (and its descendants).
 tree.append_child(child_node_1, child_node_4);
-
 // Iterate over the children of a node.
 for value in tree.children(child_node_1) {
     println!("value: {:?}", value);
 }
-
 // Or all the descendants in depth first search order.
 let descendants = tree
     .descendants(root_node)
     .map(|node| tree[node])
     .collect::<Vec<i32>>();
-
 assert_eq!(descendants, [1, 10, 13, 11]);
 ```
  */
@@ -345,6 +313,9 @@ impl<T> VecTree<T> {
     /// Insert `data` into the tree as a root node, allocating more
     /// capacity if necessary.
     ///
+    /// [Added in 0.3: if you insert on a tree which already has a root,
+    /// the current root becomes a child of the new root.]
+    ///
     /// The `data`'s associated index in the tree is returned.
     ///
     /// # Examples
@@ -358,15 +329,21 @@ impl<T> VecTree<T> {
     /// let root = tree.insert_root(42);
     ///
     /// assert_eq!(tree[root], 42);
+    /// assert_eq!(root, tree.get_root_index().unwrap());
+    ///
+    /// let new_root = tree.insert_root(2);
+    ///
+    /// assert_eq!(new_root, tree.get_root_index().unwrap());
     /// ```
     #[inline]
     pub fn insert_root(&mut self, data: T) -> Index {
-        if self.root_index.is_some() {
-            panic!("A root node already exists");
-        }
+        let optional_old_root = self.root_index;
 
         let node_id = self.create_node(data);
         self.root_index = Some(node_id);
+        if let Some(old_root) = optional_old_root {
+            self.append_child(node_id, old_root);
+        }
         node_id
     }
 
@@ -473,6 +450,255 @@ impl<T> VecTree<T> {
         }
 
         Some(node.data)
+    }
+
+    /// forks the given node into a tree of three nodes:
+    ///
+    /// 1. the new parent node in the place of the given node
+    /// 2. the given node as the first child of the new parent node
+    /// 3. the new sibling as the second child of the new parent node.
+    ///
+    /// If the node to fork happens to be the root node,
+    /// the new parent node will become the new root node.
+    ///
+    /// All the children of the given node remain attached to it
+    /// (thus are effectively pushed down a level).
+    ///
+    /// The parent node takes over the same spot as the given node,
+    /// taking on the same relationships.
+    ///
+    /// This will automatically allocate more
+    /// capacity if necessary.
+    ///
+    /// If the tree doesn't contain the given index,
+    /// this method is a no-op.
+    ///
+    /// This method returns the index of the new sibling, since
+    /// that, in effect, is why you are forking the tree.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use vec_tree::{VecTree};
+    /// use generational_arena::Index;
+    ///
+    /// let mut tree = VecTree::new();
+    /// let old_root = tree.insert_root(1);
+    ///
+    /// let new_sibling = tree.fork(old_root, 0, 2).unwrap();
+    ///
+    /// let new_root = tree.get_root_index().unwrap();
+    /// assert_ne!(old_root, new_root);
+    ///
+    /// assert_eq!(Some(new_root), tree.parent(old_root));
+    /// assert_eq!(tree.parent(new_sibling), tree.parent(old_root));
+    ///
+    /// let siblings = tree.children(new_root).collect::<Vec<Index>>();
+    /// assert_eq!(siblings[0], old_root);
+    /// assert_eq!(siblings[1], new_sibling);
+    ///
+    /// ```
+    pub fn fork(&mut self, node_id_to_fork: Index, new_parent_data: T, new_sibling_data: T) -> Option<Index> {
+        if !self.contains(node_id_to_fork) {
+            return None;
+        }
+        // Pull out the node and hang onto its links
+        let (optional_parent_node_id, optional_previous_sibling_id, optional_next_sibling_id) = {
+            let node = &self.nodes[node_id_to_fork];
+            let optional_parent_node_id = node.parent;
+            let optional_previous_sibling_id = node.previous_sibling;
+            let optional_next_sibling_id = node.next_sibling;
+            (optional_parent_node_id, optional_previous_sibling_id, optional_next_sibling_id)
+        };
+
+        // Create a new parent node and link it in
+        let new_parent_node = Node {
+            parent: optional_parent_node_id,
+            previous_sibling: optional_previous_sibling_id,
+            next_sibling: optional_next_sibling_id,
+            first_child: Some(node_id_to_fork),
+            last_child: None,
+            data: new_parent_data,
+        };
+        let new_parent_node_id = self.nodes.insert(new_parent_node);
+        if let Some(parent_node_id) = optional_parent_node_id {
+            if self.nodes[parent_node_id].first_child == Some(node_id_to_fork) {
+                self.nodes[parent_node_id].first_child = Some(new_parent_node_id)
+            }
+            if self.nodes[parent_node_id].last_child == Some(node_id_to_fork) {
+                self.nodes[parent_node_id].last_child = Some(node_id_to_fork)
+            }
+        } else {
+            // No grandparent -- we need to update the root
+            self.root_index = Some(new_parent_node_id)
+        }
+        // Update the uncles and aunts
+        if let Some(previous_sibling_id) = optional_previous_sibling_id {
+            self.nodes[previous_sibling_id].next_sibling = Some(new_parent_node_id);
+        }
+        if let Some(next_sibling_id) = optional_next_sibling_id {
+            self.nodes[next_sibling_id].previous_sibling = Some(new_parent_node_id);
+        }
+
+        // Create a new next sibling node and link it in
+        let new_sibling_node = Node {
+            parent: Some(new_parent_node_id),
+            previous_sibling: Some(node_id_to_fork),
+            next_sibling: None,
+            first_child: None,
+            last_child: None,
+            data: new_sibling_data
+        };
+        let new_next_sibling_node_id = self.nodes.insert(new_sibling_node);
+        self.nodes[new_parent_node_id].last_child = Some(new_next_sibling_node_id);
+
+        // Now link our original node back into the tree at the right spot
+        let mut node = self.nodes.get_mut(node_id_to_fork).unwrap();
+        node.parent = Some(new_parent_node_id);
+        node.previous_sibling = None;
+        node.next_sibling = Some(new_next_sibling_node_id);
+
+        return Some(new_next_sibling_node_id)
+    }
+
+    /// Merge the two given nodes together
+    /// The two nodes are required to have the same parent.
+    ///
+    /// All the children of the first node
+    /// become children of the second.
+    ///
+    /// If this leaves one child of the parent,
+    /// the child is automatically merged into the parent.
+    pub fn merge(&mut self, node_id: Index, merge_into_node_id: Index) {
+        // Ensure all the requirements are met
+        if !self.nodes.contains(node_id) || !self.nodes.contains(merge_into_node_id) {
+            return
+        }
+        if self.nodes[node_id].parent != self.nodes[merge_into_node_id].parent {
+            return
+        }
+        // big problems if we try to merge into ourselves.
+        if node_id == merge_into_node_id {
+            return
+        }
+        // actually this will never happen as we can't have two
+        // distinct root nodes...
+        if self.nodes[node_id].parent.is_none() {
+            return
+        }
+
+        // Gather the information we need that won't be available later:
+        let parent_id = self.nodes[node_id].parent.unwrap();
+        let siblings:Vec<Index> = self.children(parent_id).collect();
+        let optional_previous_sibling_id = self.nodes[node_id].previous_sibling;
+        let optional_next_sibling_id = self.nodes[node_id].next_sibling;
+
+
+        // Determine the birth order of the two nodes:
+        let (first_sibling_id, second_sibling_id) =
+            if Self::is_before(&siblings, node_id, merge_into_node_id) {
+                (node_id, merge_into_node_id)
+            } else {
+                (merge_into_node_id, node_id)
+            };
+        // Collect all the children of the blended family,
+        // because the tree will be corrupt by the time we need it:
+        let step_children = {
+            let mut children = self.children(first_sibling_id).collect::<Vec<Index>>();
+            children.extend(self.children(second_sibling_id).collect::<Vec<Index>>());
+            children
+        };
+
+        // connect the last child of the first sibling to the first child of the second sibling
+        let optional_eldest_first_cousin_id = self.nodes[first_sibling_id].last_child;
+        let optional_youngest_second_cousin_id = self.nodes[second_sibling_id].first_child;
+
+        // START OF SECTION WHERE TREE IS CORRUPT:
+        if let Some(eldest_first_cousin_id) = optional_eldest_first_cousin_id {
+            if let Some(youngest_second_cousin_id) = optional_youngest_second_cousin_id {
+                self.nodes[eldest_first_cousin_id].next_sibling = Some(youngest_second_cousin_id);
+                self.nodes[youngest_second_cousin_id].previous_sibling = Some(eldest_first_cousin_id);
+            }
+        }
+        // Now go through the children we collected above and adjust the parent index.
+        for &child_id in &step_children {
+            self.nodes[child_id].parent = Some(merge_into_node_id)
+        }
+        // Make sure the new parent has correct first and last node
+        if step_children.len() > 0 {
+            self.nodes[merge_into_node_id].first_child = Some(step_children[0]);
+            self.nodes[merge_into_node_id].last_child = Some(step_children[step_children.len()-1]);
+        }
+
+        // Now remove the node from its parent
+        if self.nodes[parent_id].first_child == Some(node_id) {
+            self.nodes[parent_id].first_child = self.nodes[node_id].next_sibling;
+        }
+        if self.nodes[parent_id].last_child == Some(node_id) {
+            self.nodes[parent_id].last_child = self.nodes[node_id].previous_sibling;
+        }
+        // And connect its siblings around it
+        if let Some(previous_sibling_id) = optional_previous_sibling_id {
+            self.nodes[previous_sibling_id].next_sibling = optional_next_sibling_id
+        }
+        if let Some(next_sibling_id) = optional_next_sibling_id {
+            self.nodes[next_sibling_id].previous_sibling = optional_previous_sibling_id
+        }
+        // END OF SECTION WHERE TREE IS CORRUPT (although it may now have a parent with one child)
+
+        // Merge the sibling and the parent if the sibling is now an only child
+        if siblings.len() == 2 {
+            let optional_grandparent_id = self.nodes[parent_id].parent;
+            if let Some(grandparent_id) = optional_grandparent_id {
+                // grab the parent's siblings now, because the tree will be corrupt
+                // by the time we need it.
+                let optional_previous_uncle_id = self.nodes[parent_id].previous_sibling;
+                let optional_next_uncle_id = self.nodes[parent_id].next_sibling;
+
+                // START OF SECTION WHERE TREE IS CORRUPT:
+                if self.nodes[grandparent_id].first_child == Some(parent_id) {
+                    self.nodes[grandparent_id].first_child = Some(merge_into_node_id);
+                }
+                if self.nodes[grandparent_id].last_child == Some(parent_id) {
+                    self.nodes[grandparent_id].last_child = Some(merge_into_node_id);
+                }
+                self.nodes[merge_into_node_id].parent = Some(grandparent_id);
+
+                if let Some(previous_uncle_id) = optional_previous_uncle_id {
+                    self.nodes[previous_uncle_id].next_sibling = Some(merge_into_node_id);
+                    self.nodes[merge_into_node_id].previous_sibling = Some(previous_uncle_id);
+                }
+                if let Some(next_uncle_id) = optional_next_uncle_id {
+                    self.nodes[next_uncle_id].previous_sibling = Some(merge_into_node_id);
+                    self.nodes[merge_into_node_id].next_sibling = Some(next_uncle_id);
+                }
+                // END OF SECTION WHERE TREE IS CORRUPT
+            } else {
+                self.root_index = Some(merge_into_node_id);
+                self.nodes[merge_into_node_id].parent = None;
+            }
+            self.nodes.remove(parent_id);
+        }
+        self.nodes.remove(node_id);
+    }
+
+    fn is_before(vector:&Vec<Index>, index_1: Index, index_2: Index) -> bool {
+        let mut is_index_1_found = false;
+        let mut is_index_2_found = false;
+        for &index in vector {
+            if index == index_1 {
+                if is_index_2_found {
+                    return false
+                }
+                is_index_1_found = true
+            } else if index == index_2 {
+                if is_index_1_found {
+                    return true
+                }
+                is_index_2_found = true
+            }
+        }
+        false // this indicates at least one of the two indices were not in the list
     }
 
     /// Is the element at index `node_id` in the tree?
@@ -676,6 +902,43 @@ impl<T> VecTree<T> {
             _ => None,
         }
     }
+
+    /// Return whether or not the node has children
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use vec_tree::VecTree;
+    ///
+    /// let mut tree = VecTree::with_capacity(10);
+    /// let branch = tree.insert_root(0);
+    /// let leaf = tree.insert(1, branch);
+    ///
+    /// assert_eq!(true, tree.has_children(branch));
+    /// assert_eq!(false, tree.has_children(leaf));
+    ///
+    /// ```
+    #[inline]
+    pub fn has_children(&self, node_id: Index) -> bool {
+        match self.nodes.get(node_id) {
+            Some(node) => !(node.first_child == None && node.last_child == None),
+            None => false
+        }
+    }
+
+    /// Return whether or not the node is a leaf
+    /// (i.e. doesn't have children)
+    ///
+    /// This version for use in filter predicates
+    #[inline]
+    pub fn is_leaf_ref(&self, node_id: &Index) -> bool { !self.has_children(node_id.clone()) }
+
+    /// Return whether or not the node is a leaf
+    /// (i.e. doesn't have children)
+    ///
+    /// This version for use directly
+    #[inline]
+    pub fn is_leaf(&self, node_id: Index) -> bool { !self.has_children(node_id) }
 
     /// Return an iterator of references to this node’s children.
     pub fn children(&self, node_id: Index) -> ChildrenIter<T> {
